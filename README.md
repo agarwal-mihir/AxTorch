@@ -1,4 +1,117 @@
-# ApproxTorch
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/axtorch-logo-dark.svg">
+    <img alt="AxTorch" src="assets/axtorch-logo.svg" width="640">
+  </picture>
+</p>
+
+# AxTorch
+
+> **AxTorch is a fork of [ApproxTorch](https://github.com/woshimark666/ApproxTorch)
+> by Ke Ma (MIT).** It adds transformer/LLM support and a faster LUT-GEMM CUDA
+> kernel and keeps everything else unchanged. The Python package is still
+> `approxtorch`, so `import approxtorch as at` keeps working as a drop-in
+> replacement. All credit for the original library belongs to its authors; if you
+> use AxTorch, please [cite ApproxTorch](#citation).
+
+## What AxTorch adds
+
+### Transformers and LLMs (`approxtorch.transformer`)
+
+`approximate_model` replaces each `nn.Linear` in a model with a LUT-approximate
+`LutLinear`. It also routes both attention matmuls (Q·Kᵀ and softmax·V) of any
+Hugging Face model through the LUT. Since pretrained models have no QAT
+checkpoint, quantization is symmetric int8: weights are scaled per output
+channel once, activations per token, and attention operands per row or column.
+Elementwise products such as RoPE, norms and GLU gates stay exact.
+
+```python
+import torch
+import approxtorch as at
+from transformers import AutoModelForCausalLM
+
+v = torch.arange(-128, 128)
+lut = (v[:, None] * v[None, :]).int().reshape(-1).cuda()  # exact; or at.load_lut.load_lut('my_mult.txt', 'int8')
+model = AutoModelForCausalLM.from_pretrained('google/gemma-3-270m').cuda().eval()
+replaced = at.transformer.approximate_model(model, lut)  # skips lm_head by default
+# lut.copy_(other_lut) switches every patched layer to another multiplier in place
+```
+
+Lower-level building blocks:
+- `approx_matmul(a, b, lut)`: float a @ b through the LUT.
+- `approx_attention(q, k, v, lut, attn_mask)`: attention for plain PyTorch modules.
+- `lut_matmul`: the integer version of `approx_matmul`.
+
+`nn.MultiheadAttention` is not patched.
+
+Gemma 3 270M on WikiText-2 (8,192 tokens, RTX A6000), with approximate
+multipliers from an NSGA-II search:
+
+| Design | MRED | Perplexity | Next-token acc. |
+|---|---|---|---|
+| float32 | — | 26.09 | 39.6% |
+| exact int8 | 0 | 27.01 | 39.2% |
+| approximate, MRED 0.030 | 0.030 | 30.73 | 38.1% |
+| approximate, MRED 0.046 | 0.046 | 37.55 | 35.3% |
+| approximate, MRED 0.081 | 0.081 | 70.30 | 28.7% |
+| approximate, MRED 0.117 | 0.117 | 365.55 | 15.8% |
+
+A ViT-Small trained on MNIST stays between 97.7% and 98.1% top-1 across the same
+designs.
+
+### LUT-GEMM kernel (`approxtorch.backend.lut_kernel`)
+
+`lut_gemm.cu` is built as `approxtorch.backend._lut_gemm` and replaces
+`gemm_int8`, `bgemm_int8` and `im2col_int8` on CUDA. Its results are
+**bit-identical** to those ops.
+- It keeps the half of the 256×256 LUT that the operands can reach in shared
+  memory, as a 64 KB int16 table.
+- Convolutions gather their inputs directly (implicit GEMM, no im2col buffer).
+- Activations are quantized and zero-padded in a single pass.
+- The zero-point correction, scaling and bias are fused into the GEMM.
+
+The transformer path uses it automatically for every matmul, as one batched
+launch over all (sample, head) pairs. For CNN layers, the raw ops are exposed:
+`table`, `conv`, `conv2d`, `linear`, `batched` and `quantize_u7`. The layers
+from `convert_int_model` do not use the kernel yet.
+
+Op-level timings on an RTX A6000, using a random LUT:
+
+| Op | ApproxTorch ops | LUT-GEMM | Speed-up |
+|---|---:|---:|---:|
+| 3×3 conv, 64→64 ch, 8×8, batch 256 (`im2col_int8` + `bgemm_int8` vs `conv2d`) | 2.39 ms | 0.50 ms | 4.8× |
+| Linear 2048×640 @ 640×2048 (`gemm_int8` vs `linear`) | 20.8 ms | 2.0 ms | 10.4× |
+| Attention Q·Kᵀ, 1536 (sample, head) pairs of 65×64 @ 64×65 (loop of `gemm_int8` vs one `batched` launch) | 123 ms | 0.91 ms | 136× |
+
+Per-candidate evaluation on an RTX A6000, measured in a downstream search
+framework that wires these ops into its integer layers (full test set,
+batch 256):
+
+| Workload | ApproxTorch ops | LUT-GEMM | Speed-up |
+|---|---:|---:|---:|
+| LeNet-5, MNIST | 0.058 s | 0.016 s | 3.6× |
+| MLP, MNIST | 0.027 s | 0.012 s | 2.3× |
+| ResNet-20, CIFAR-10 | 1.774 s | 0.391 s | 4.5× |
+| ResNet-50, CIFAR-10 | 43.6 s | 9.93 s | 4.4× |
+| ViT-S MNIST, 3 designs | 205 s | 30 s | 6.8× |
+
+The kernel needs at least 96 KB of shared memory per block. That covers V100,
+A100, H100 and RTX 30/40/A-series GPUs. `table()` returns `None` and callers fall
+back to the original ops in these cases:
+- Turing (T4, RTX 20xx) and older GPUs;
+- LUT entries outside the int16 range;
+- convolutions with C·kh·kw > 5632;
+- for the transformer path, LUTs that are not sign-symmetric.
+
+Set `APPROXTORCH_LUT_GEMM=0` to force the fallback.
+
+Tests (`python -m unittest discover -s tests`) check the kernel bit for bit
+against `gemm_int8`/`bgemm_int8`/`im2col_int8`. They also check tiny Gemma 3 and
+ViT models against eager attention with an exact LUT.
+
+---
+
+The rest of this README is the original ApproxTorch documentation.
 
 **ApproxTorch** is a PyTorch extension for simulating **approximate multipliers** inside Convolutional Neural Networks — for both **training (QAT)** and **inference** — entirely on the GPU.
 
@@ -39,10 +152,16 @@ mantissa LUTs for approximate **FP16 and BF16** GEMM and BGEMM.
 ## Installation
 
 ```bash
-git clone https://github.com/mark531593296/ApproxTorch.git
-cd ApproxTorch
-pip install .
+git clone https://github.com/agarwal-mihir/AxTorch.git
+cd AxTorch
+pip uninstall -y approxtorch   # AxTorch installs the same `approxtorch` package
+pip install . --no-build-isolation
 ```
+
+The distribution is named `axtorch` but still provides the `approxtorch` package,
+so uninstall any existing ApproxTorch first. `approxtorch.transformer` needs
+`transformers` (tested with 5.19) only for `approximate_model(..., attention=True)`.
+The original library lives at https://github.com/woshimark666/ApproxTorch.
 
 Or, for an editable install with [uv](https://github.com/astral-sh/uv):
 
@@ -318,6 +437,8 @@ y = bgemm_bf16_custom(X, W, lutb, grad_x_lut, grad_w_lut)
 ```text
 approxtorch/
 ├── backend/            # custom op registration + CUDA/C++ kernels
+│   ├── lut_gemm.cu     # AxTorch: shared-memory LUT-GEMM kernel (_lut_gemm)
+│   ├── lut_kernel.py   # AxTorch: Python wrappers and fallback checks
 │   └── csrc/
 │       ├── cuda/       # approximate (b)gemm, im2col, LUT lookup, backward kernels
 │       └── cpu/        # CPU reference implementations
@@ -327,12 +448,15 @@ approxtorch/
 ├── grad_lut.py         # gradient LUT generation (LRE, DATE)
 ├── quant_utils.py      # calibration utilities
 └── calib.py            # standalone min-max calibration helper
+└── transformer.py      # AxTorch: LutLinear, LUT attention, approximate_model
+assets/                 # AxTorch logo
 test/                   # example LUTs, ResNet-20/CIFAR-10 scripts, kernel tests
+tests/                  # AxTorch: unittest suite for the kernel and transformer path
 ```
 
 ## Citation
 
-If you use ApproxTorch in your work, please cite:
+AxTorch is built on ApproxTorch. If you use either in your work, please cite:
 
 ```bibtex
 @INPROCEEDINGS{10031519,
@@ -346,7 +470,8 @@ If you use ApproxTorch in your work, please cite:
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). The original ApproxTorch copyright (Ke Ma) is retained. The AxTorch
+additions are also MIT.
 
 ## Famous quote
 
