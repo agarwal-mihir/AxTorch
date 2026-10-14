@@ -2,6 +2,8 @@ import torch
 from torch import Tensor
 from torch.nn.modules.utils import _pair
 
+from . import lut_kernel
+
 
 __all__ = ['im2col_int8', 
            'im2col_uint8', 
@@ -327,7 +329,17 @@ def gemm_fp16_naive(A: Tensor, B: Tensor, lut: Tensor) -> Tensor:
     return torch.ops.approxtorch.gemm_fp16_naive.default(A, B, lut)
 
 
+def _code_gemm(lut: Tensor, side: int, dtype, a: Tensor, b: Tensor, a_dim: int) -> bool:
+    """The bf16/fp16 gemm/bgemm below run lut_kernel's code_gemm (bit-identical) on valid inputs;
+    anything else goes to the upstream op, which raises the usual errors."""
+    return (lut_kernel._extension() is not None and lut.is_cuda and lut.dtype == torch.uint32
+            and lut.shape == (side, side) and a.dim() == a_dim and b.dim() == 2
+            and all(x.is_cuda and x.dtype == dtype and x.device == lut.device for x in (a, b)))
+
+
 def gemm_fp16(A: Tensor, B: Tensor, lut: Tensor) -> Tensor:
+    if _code_gemm(lut, 1024, torch.float16, A, B, 2) and A.size(1) == B.size(0):
+        return lut_kernel.matmul(A, B, lut, "fp16")
     return torch.ops.approxtorch.gemm_fp16.default(A, B, lut)
 
 
@@ -336,6 +348,8 @@ def gemm_bf16_naive(A: Tensor, B: Tensor, lut: Tensor) -> Tensor:
 
 
 def gemm_bf16(A: Tensor, B: Tensor, lut: Tensor) -> Tensor:
+    if _code_gemm(lut, 128, torch.bfloat16, A, B, 2) and A.size(1) == B.size(0):
+        return lut_kernel.matmul(A, B, lut, "bf16")
     return torch.ops.approxtorch.gemm_bf16.default(A, B, lut)
 
 
@@ -344,6 +358,8 @@ def bgemm_fp16_naive(X: Tensor, W: Tensor, lut: Tensor) -> Tensor:
 
 
 def bgemm_fp16(X: Tensor, W: Tensor, lut: Tensor) -> Tensor:
+    if _code_gemm(lut, 1024, torch.float16, X, W, 3) and X.size(1) == W.size(1):
+        return lut_kernel.bgemm(X, W, lut, "fp16", x_row=True)
     return torch.ops.approxtorch.bgemm_fp16.default(X, W, lut)
 
 
@@ -352,4 +368,6 @@ def bgemm_bf16_naive(X: Tensor, W: Tensor, lut: Tensor) -> Tensor:
 
 
 def bgemm_bf16(X: Tensor, W: Tensor, lut: Tensor) -> Tensor:
+    if _code_gemm(lut, 128, torch.bfloat16, X, W, 3) and X.size(1) == W.size(1):
+        return lut_kernel.bgemm(X, W, lut, "bf16", x_row=True)
     return torch.ops.approxtorch.bgemm_bf16.default(X, W, lut)
