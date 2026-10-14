@@ -21,7 +21,8 @@
 `approximate_model` replaces each `nn.Linear` in a model with a LUT-approximate
 `LutLinear`. It also routes both attention matmuls (Q·Kᵀ and softmax·V) of any
 Hugging Face model through the LUT. Since pretrained models have no QAT
-checkpoint, quantization is symmetric int8: weights are scaled per output
+checkpoint, quantization is symmetric int8 by default (other formats:
+`kind=`, [below](#other-precisions-lut_kernelmatmul)): weights are scaled per output
 channel once, activations per token, and attention operands per row or column.
 Elementwise products such as RoPE, norms and GLU gates stay exact.
 
@@ -83,6 +84,11 @@ Op-level timings on an RTX A6000, using a random LUT:
 | Linear 2048×640 @ 640×2048 (`gemm_int8` vs `linear`) | 20.8 ms | 2.0 ms | 10.4× |
 | Attention Q·Kᵀ, 1536 (sample, head) pairs of 65×64 @ 64×65 (loop of `gemm_int8` vs one `batched` launch) | 123 ms | 0.91 ms | 136× |
 
+These baselines are the default ApproxTorch ops. ApproxTorch also ships faster
+float-LUT variants (`gemm_fake_int8_claude`, `bgemm_fake_int8_claude`, …). Against
+those, LUT-GEMM is about 1.5–3× faster for convolutions, 0.8–1.8× for linears and
+about 97× for batched attention.
+
 Per-candidate evaluation on an RTX A6000, measured in a downstream search
 framework that wires these ops into its integer layers (full test set,
 batch 256):
@@ -100,14 +106,94 @@ A100, H100 and RTX 30/40/A-series GPUs. `table()` returns `None` and callers fal
 back to the original ops in these cases:
 - Turing (T4, RTX 20xx) and older GPUs;
 - LUT entries outside the int16 range;
-- convolutions with C·kh·kw > 5632;
-- for the transformer path, LUTs that are not sign-symmetric.
+- convolutions with C·kh·kw > 5632.
 
 Set `APPROXTORCH_LUT_GEMM=0` to force the fallback.
 
-Tests (`python -m unittest discover -s tests`) check the kernel bit for bit
-against `gemm_int8`/`bgemm_int8`/`im2col_int8`. They also check tiny Gemma 3 and
-ViT models against eager attention with an exact LUT.
+### Other precisions (`lut_kernel.matmul`)
+
+`matmul(a, b, lut, kind)` sends every product of `a @ b` through the LUT for
+nine operand formats, using one templated kernel (`code_gemm.cu`). `a` selects
+the LUT row and leading dims broadcast. `bgemm(x, w, lut, kind)` takes the
+upstream `[B, K, L] × [O, K]` layout. `reference(...)` is a pure-torch version of
+`matmul` that runs on any device and also serves as the CPU fallback.
+
+| `kind` | Operands | LUT | Result |
+|---|---|---|---|
+| `int4` | int8 in [-8, 7] | 256 int32, index `(a+8)*16 + b+8` | int32 |
+| `int8` | int8 | `load_lut(.., 'int8')`, any LUT (not only sign-symmetric) | int32 |
+| `uint8` | uint8 | `load_lut(.., 'uint8')` | int32 |
+| `int16` | int16 | the uint8 LUT, entries in [0, 65535] | int64 |
+| `fp8_e4m3`, `fp8_e5m2` | `torch.float8_e4m3fn` / `float8_e5m2` | float32 256×256 code-pair table from `fp_table` | float32 |
+| `fp4` | uint8 E2M1 codes from `fp4_encode` | float32 16×16 code-pair table from `fp_table` | float32 |
+| `bf16` | bfloat16 | upstream 128×128 mantissa LUT | bfloat16 |
+| `fp16` | float16 | upstream 1024×1024 mantissa LUT | float16 |
+
+Semantics:
+- **Bit-identity.** int8/uint8 match `gemm_int8`/`bgemm_int8`/`gemm_uint8`/`bgemm_uint8`
+  bit for bit. bf16/fp16 match `gemm_bf16_naive` etc., including the upstream
+  RTL's 5/8-bit exponent wrap. `ops.gemm_bf16`, `gemm_fp16`, `bgemm_bf16` and
+  `bgemm_fp16` now run on this kernel. Integer sums are exact. Float sums are
+  float32, accumulated in ascending k.
+- **int16** is sign-magnitude over four 8×8 multipliers. With |x| = 256h + l, the
+  product is ±(T[ha,hb]·2¹⁶ + (T[ha,lb] + T[la,hb])·2⁸ + T[la,lb]).
+- **FP8/FP4 tables.** `fp_table(mantissa_lut, fmt)` builds the code-pair table
+  from an upstream-style mantissa LUT. Unlike the 16-bit RTL, it keeps the
+  product's exponent exact, because an FP8/FP4 product is wider than its
+  operands (as in MX/tensor-core MACs). Subnormals are normalized before the
+  lookup, and a zero operand gives +0. Any other float32 table works too.
+- **LUT row in `bgemm`.** By default `w` selects the LUT row, as in upstream
+  `bgemm_int8`/`bgemm_uint8`. Upstream `bgemm_bf16`/`bgemm_fp16` index the other
+  way: pass `x_row=True`.
+- **Shared memory.** Tables that fit in shared memory (int4, fp4, bf16, and
+  sign-symmetric fp8 at 64 KB) are kept there. The rest (int8/uint8/int16 at
+  128 KB, asymmetric fp8 at 256 KB, fp16 at 2 MB) are read through L1. On
+  A100/H100, 128 KB tables would fit in shared memory, but this is untested.
+
+The transformer API takes the same `kind` (`approximate_model(model, lut,
+kind='fp8_e4m3')`). Quantization is symmetric, scaled to the format's max:
+- bf16 is a plain cast;
+- fp16 is scaled to |x| ≤ min(16, √(2¹³/K)) for a K-long reduction, with
+  |x| < 2⁻⁷ flushed to zero. Products then never reach the RTL's exponent wrap,
+  and sums stay inside the fp16 range;
+- uint8 needs zero points and is not offered.
+
+int8 with a sign-symmetric LUT keeps using the faster int8 kernel above.
+
+Max relative error vs float32 of a random linear layer plus attention, with
+exact multipliers (tests use about 2× these as tolerances):
+
+| int4 | int8 | int16 | fp8_e4m3 | fp8_e5m2 | fp4 | bf16 | fp16 |
+|---|---|---|---|---|---|---|---|
+| 0.20 | 0.011 | 4e-5 | 0.080 | 0.11 | 0.19 | 0.007 | 6e-4 |
+
+Timings in ms on an RTX A6000 (a shared GPU, best of 3 runs). In parentheses:
+the fastest upstream op (`gemm_fake_int8_claude`, `gemm_fake_uint8_claude`,
+`gemm_bf16`, `gemm_fp16`):
+
+| `kind` | 2048×640 @ 640×2048 | 512×512 @ 512×512 | 64×4096 @ 4096×4096 | 256×784 @ 784×300 | 8×4096 @ 4096×4096 |
+|---|---:|---:|---:|---:|---:|
+| int4 | 1.50 | 0.10 | 0.76 | 0.07 | 0.67 |
+| int8 | 2.06 (2.83) | 0.18 (0.21) | 1.18 (1.30) | 0.17 (0.13) | 0.70 (0.43) |
+| uint8 | 2.05 (2.99) | 0.18 (0.21) | 1.22 (1.30) | 0.17 (0.13) | 0.70 (0.43) |
+| int16 | 10.5 | 0.64 | 5.06 | 0.46 | 2.56 |
+| fp8 (either) | 1.94 | 0.13 | 1.02 | 0.10 | 0.78 |
+| fp4 | 1.61 | 0.11 | 0.80 | 0.07 | 0.69 |
+| bf16 | 4.66 (11.0) | 0.20 (0.35) | 2.32 (4.09) | 0.12 (0.19) | 1.46 (0.51) |
+| fp16 | 23.1 (49.9) | 0.50 (1.29) | 3.87 (12.6) | 0.71 (0.68) | 2.36 (0.97) |
+| fp32 `torch.mm` | 0.27 | 0.025 | 0.12 | 0.02 | 0.12 |
+
+`bgemm` with X of shape 256×576×64 and W of 64×576: bf16 takes 1.26 ms (1.65
+upstream) and fp16 6.85 ms (6.21).
+
+Float sums must stay in k order for bit-identity, so K is never split across
+blocks. As a result, very skinny products (M ≤ 16, e.g. LLM decode) run 1.5–3×
+slower than upstream.
+
+Tests (`python -m unittest discover -s tests`) check the kernels bit for bit
+against `gemm_int8`/`bgemm_int8`/`im2col_int8`, `gemm_uint8`/`bgemm_uint8`,
+`gemm_bf16_naive`/`gemm_fp16_naive` and the torch reference for every kind. They
+also check tiny Gemma 3 and ViT models against eager attention with an exact LUT.
 
 ---
 

@@ -58,7 +58,7 @@ cuda_functions = CUDAExtension('approxtorch.backend._C',[
 
 # LUT-GEMM (pybind11 module, so built without the limited API flag above).
 lut_gemm = CUDAExtension(
-    'approxtorch.backend._lut_gemm', ['./approxtorch/backend/lut_gemm.cu'],
+    'approxtorch.backend._lut_gemm', ['./approxtorch/backend/lut_gemm.cu', './approxtorch/backend/code_gemm.cu'],
     extra_compile_args={'nvcc': ([] if os.environ.get('TORCH_CUDA_ARCH_LIST') else ['-arch=native']) +
                                 ['-std=c++17', '-O3'],
                         'cxx': ['-O3']},

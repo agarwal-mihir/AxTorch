@@ -240,16 +240,18 @@ void launch(const Params& p) {
   constexpr size_t base = TABLE_BYTES + BK * BM * 4 + BK * BN;
   constexpr size_t smem_max = base + (LOAD == LOAD_IM2COL ? MAX_IM2COL_K * 4 : 0);
   const size_t smem = base + (LOAD == LOAD_IM2COL ? p.K * 4 : 0);
-  static int grid_cap = 0;  // ponytail: one device per process, as the evaluator pool runs
-  if (grid_cap == 0) {
+  static int grid_cap[64] = {};  // kernel attributes are per device
+  const int dev = c10::cuda::current_device();
+  TORCH_CHECK(dev < 64, "device index too large");
+  if (grid_cap[dev] == 0) {
     C10_CUDA_CHECK(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max));
     int per_sm = 0;
     C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, THREADS, smem_max));
-    grid_cap = at::cuda::getCurrentDeviceProperties()->multiProcessorCount * std::max(per_sm, 1);
+    grid_cap[dev] = at::cuda::getCurrentDeviceProperties()->multiProcessorCount * std::max(per_sm, 1);
   }
   const long long tiles = (long long)p.Z * ((p.M + BM - 1) / BM) * ((p.N + BN - 1) / BN);
-  const int grid = (int)std::min<long long>(tiles, grid_cap);
+  const int grid = (int)std::min<long long>(tiles, grid_cap[dev]);
   if (grid == 0) return;
   kernel<<<grid, THREADS, smem, at::cuda::getCurrentCUDAStream()>>>(p);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -380,8 +382,12 @@ at::Tensor quantize_u7(const at::Tensor& x, const at::Tensor& scale, const at::T
   return y;
 }
 
+at::Tensor code_gemm(const at::Tensor& A, const at::Tensor& B, const at::Tensor& T, int64_t kind,
+                     int64_t shift, bool smem_ok);  // code_gemm.cu
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("lut_gemm", &lut_gemm);
   m.def("lut_conv2d", &lut_conv2d);
   m.def("quantize_u7", &quantize_u7);
+  m.def("code_gemm", &code_gemm);
 }
