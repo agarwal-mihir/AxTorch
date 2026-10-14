@@ -1,5 +1,5 @@
 build/
-approxtorch.egg-info/
+*.egg-info/
 __pycache__/
 test/
 dist/
@@ -8,7 +8,7 @@ dist/
 benchmarks/
 docs/
 tools/
-tests/
+
 .vscode/
 .claude/
 .pytest_cache/

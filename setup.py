@@ -56,13 +56,22 @@ cuda_functions = CUDAExtension('approxtorch.backend._C',[
                                 ]},
 )
 
+# LUT-GEMM (pybind11 module, so built without the limited API flag above).
+lut_gemm = CUDAExtension(
+    'approxtorch.backend._lut_gemm', ['./approxtorch/backend/lut_gemm.cu'],
+    extra_compile_args={'nvcc': ([] if os.environ.get('TORCH_CUDA_ARCH_LIST') else ['-arch=native']) +
+                                ['-std=c++17', '-O3'],
+                        'cxx': ['-O3']},
+)
+
 
 setup(
-    name="approxtorch",
+    name="axtorch",
     version="2.0",
-    description="a simulation framework for 8-bit (u)signed approximate multiplier in CNNs",
+    description="Approximate-multiplier simulation for CNNs and transformers (fork of ApproxTorch)",
+    url="https://github.com/agarwal-mihir/AxTorch",
     packages=find_packages(),
-    ext_modules=[cuda_functions],    # extensions to be compiled
+    ext_modules=[cuda_functions, lut_gemm],    # extensions to be compiled
     install_requires=['torch'],
     cmdclass={'build_ext': BuildExtension},
     options={'bdist_whell': {"py_limited_api": "cp39"}}
